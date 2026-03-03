@@ -1,14 +1,12 @@
 from fastapi import FastAPI, UploadFile, File
+from pydantic import BaseModel
 import chromadb
 import uuid
 
 app = FastAPI(title="Context-Aware AI Assistant (RAG)")
 
 # --- ІНІЦІАЛІЗАЦІЯ БАЗИ ДАНИХ ---
-# Створюємо локальну базу, яка збережеться у папці "chroma_db" прямо у твоєму проєкті
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
-
-# Створюємо або отримуємо колекцію (це як таблиця в SQL)
 collection = chroma_client.get_or_create_collection(name="documents_collection")
 
 def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50):
@@ -21,6 +19,12 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50):
         start += chunk_size - overlap 
     return chunks
 
+# --- МОДЕЛІ ДАНИХ ---
+# Цей клас описує, як має виглядати запит від користувача
+class QueryRequest(BaseModel):
+    question: str
+    n_results: int = 2  # Скільки шматків тексту ми хочемо знайти (за замовчуванням 2)
+
 # --- ENDPOINTS ---
 @app.get("/")
 def read_root():
@@ -32,23 +36,25 @@ async def upload_document(file: UploadFile = File(...)):
     text = content.decode("utf-8")
     
     text_chunks = chunk_text(text, chunk_size=500, overlap=50)
-    
-    # 1. Генеруємо унікальні ID для кожного шматка тексту (це вимога бази)
     chunk_ids = [str(uuid.uuid4()) for _ in text_chunks]
-    
-    # 2. Зберігаємо метадані (щоб знати, з якого файлу цей шматок)
     metadatas = [{"source": file.filename} for _ in text_chunks]
     
-    # 3. МАГІЯ: Додаємо в базу! 
-    # ChromaDB автоматично перетворить текст на вектори (Embeddings) під капотом
-    collection.add(
-        documents=text_chunks,
-        ids=chunk_ids,
-        metadatas=metadatas
+    collection.add(documents=text_chunks, ids=chunk_ids, metadatas=metadatas)
+    
+    return {"filename": file.filename, "total_chunks_saved": len(text_chunks)}
+
+# НОВИЙ ЕНДПОІНТ: СЕМАНТИЧНИЙ ПОШУК
+@app.post("/search")
+async def search_document(query: QueryRequest):
+    # 1. ChromaDB сама перетворює питання на вектор
+    # 2. Шукає в базі найближчі математичні співпадіння
+    results = collection.query(
+        query_texts=[query.question],
+        n_results=query.n_results
     )
     
     return {
-        "filename": file.filename, 
-        "total_chunks_saved": len(text_chunks),
-        "db_status": f"Successfully embedded and saved to ChromaDB collection: {collection.name}"
+        "question": query.question,
+        "relevant_chunks": results["documents"][0],  # Знайдений текст
+        "distances": results["distances"][0]         # Наскільки це точний збіг (менше число = краще)
     }
