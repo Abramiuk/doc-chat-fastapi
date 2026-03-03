@@ -1,11 +1,25 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 import chromadb
 import uuid
+import google.generativeai as genai
+import os
+from dotenv import load_dotenv
+
+# --- LOAD SECRET API KEY ---
+load_dotenv() # This reads the .env file
+GOOGLE_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not GOOGLE_API_KEY:
+    raise ValueError("API Key not found! Please check your .env file.")
+
+# Configure Gemini
+genai.configure(api_key=GOOGLE_API_KEY)
+llm = genai.GenerativeModel('gemini-flash-latest') 
 
 app = FastAPI(title="Context-Aware AI Assistant (RAG)")
 
-# --- ІНІЦІАЛІЗАЦІЯ БАЗИ ДАНИХ ---
+# --- DATABASE INITIALIZATION ---
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
 collection = chroma_client.get_or_create_collection(name="documents_collection")
 
@@ -19,11 +33,9 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50):
         start += chunk_size - overlap 
     return chunks
 
-# --- МОДЕЛІ ДАНИХ ---
-# Цей клас описує, як має виглядати запит від користувача
 class QueryRequest(BaseModel):
     question: str
-    n_results: int = 2  # Скільки шматків тексту ми хочемо знайти (за замовчуванням 2)
+    n_results: int = 2
 
 # --- ENDPOINTS ---
 @app.get("/")
@@ -43,18 +55,40 @@ async def upload_document(file: UploadFile = File(...)):
     
     return {"filename": file.filename, "total_chunks_saved": len(text_chunks)}
 
-# НОВИЙ ЕНДПОІНТ: СЕМАНТИЧНИЙ ПОШУК
-@app.post("/search")
-async def search_document(query: QueryRequest):
-    # 1. ChromaDB сама перетворює питання на вектор
-    # 2. Шукає в базі найближчі математичні співпадіння
-    results = collection.query(
-        query_texts=[query.question],
-        n_results=query.n_results
-    )
-    
-    return {
-        "question": query.question,
-        "relevant_chunks": results["documents"][0],  # Знайдений текст
-        "distances": results["distances"][0]         # Наскільки це точний збіг (менше число = краще)
-    }
+@app.post("/ask")
+async def ask_assistant(query: QueryRequest):
+    try:
+        # 1. RETRIEVAL
+        results = collection.query(
+            query_texts=[query.question],
+            n_results=query.n_results
+        )
+        
+        if not results["documents"] or not results["documents"][0]:
+            raise HTTPException(status_code=404, detail="No documents found in the database.")
+        
+        found_context = " ".join(results["documents"][0])
+        
+        # 2. AUGMENTATION
+        prompt = f"""
+        You are a smart and concise assistant. Your task is to answer the user's question.
+        You MUST base your answer EXCLUSIVELY on the following document context.
+        If the answer is not in the context, simply say: "The uploaded document does not contain an answer to this question."
+        
+        DOCUMENT CONTEXT:
+        {found_context}
+        
+        USER QUESTION: 
+        {query.question}
+        """
+        
+        # 3. GENERATION
+        response = llm.generate_content(prompt)
+        
+        return {
+            "question": query.question,
+            "answer": response.text, 
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
